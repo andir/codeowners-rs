@@ -29,8 +29,17 @@ impl Owner {
     }
 }
 
+impl std::fmt::Display for Owner {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (match self {
+            Self::Email(mail) => mail,
+            Self::Handle(name) => name,
+        }).fmt(fmt)
+    }
+}
+
 /// Convert a Codeowners pattern into a glob pattern
-fn pattern_to_glob(pattern: impl AsRef<str>) -> String {
+fn pattern_to_glob(pattern: impl AsRef<str>) -> impl Iterator<Item = String> {
     let pattern = pattern.as_ref();
     let mut absolute = false;
 
@@ -41,18 +50,21 @@ fn pattern_to_glob(pattern: impl AsRef<str>) -> String {
     }
 
     let mut pattern = pattern.to_string();
-    // If a path ends with / then include all subpaths as well
-    if pattern.ends_with('/') {
-        pattern = format!("{}**", pattern);
-    }
-
     // for paths that aren't absolute but have a slash somewhere we must prefix them with **/ so
     // they match in any subdirectory.
     if !absolute && pattern.contains('/') {
         pattern = format!("**/{}", pattern);
     }
 
-    pattern
+    // If a path ends with / then include all subpaths as well
+    // If it doesn't well, do it nevertheless because things don't always work like in the specification
+    let subdirectory_pattern = if pattern.ends_with('/') {
+        format!("{}**", pattern)
+    } else {
+        format!("{}/**", pattern)
+    };
+
+    std::iter::once(pattern).chain(std::iter::once(subdirectory_pattern))
 }
 
 /// Representation of one Codeowner pattern and the respective list of owners.
@@ -60,7 +72,7 @@ fn pattern_to_glob(pattern: impl AsRef<str>) -> String {
 pub struct Rule {
     pub pattern: String,
     pub owners: Vec<Owner>,
-    pub matcher: globset::GlobMatcher,
+    pub matchers: Vec<globset::GlobMatcher>,
 }
 
 impl PartialEq for Rule {
@@ -88,10 +100,13 @@ impl Rule {
         }
         let pattern = parts[0].to_string();
         let owners = parts[1..].iter().map(Owner::parse).collect();
-        let matcher = globset::Glob::new(&pattern_to_glob(&pattern))?.compile_matcher();
+        let matchers = pattern_to_glob(&pattern)
+            .map(|pattern| globset::Glob::new(&pattern))
+            .map(|glob| glob.map(|glob| glob.compile_matcher()))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Rule {
-          matcher,
+          matchers,
           pattern,
           owners
         })
@@ -112,11 +127,12 @@ impl PartialEq for Codeowners {
 
 impl Codeowners {
     /// Match the given path against the set of rules and return the matching rules or None.
-    pub fn matches<'a, T: AsRef<std::path::Path>>(&'a self, path: T) -> Option<&'a Rule> {
+    pub fn matches<'a, T: AsRef<std::path::Path>>(&'a self, path: T) -> Option<&'a [Owner]> {
         let path = path.as_ref();
         self.rules.iter()
             .rev()
-            .find(|rule| rule.matcher.is_match(path))
+            .find(|rule| rule.matchers.iter().any(|matcher| matcher.is_match(path)))
+            .map(|rule| rule.owners.as_slice())
     }
 }
 
@@ -143,6 +159,16 @@ pub fn parse(input: impl AsRef<str>) -> Result<Codeowners, ParseError> {
 mod tests {
 
     use super::{Owner::*, *};
+
+    #[test]
+    fn more_test_on_nixpkgs() {
+        let codeowners = parse(
+            std::str::from_utf8(&std::fs::read("./CODEOWNERS").unwrap()).unwrap()
+        ).unwrap();
+        assert!(codeowners.matches("/lib").is_some());
+        assert!(codeowners.matches("/lib/systems").is_some());
+        assert!(codeowners.matches("/lib/foo").is_some());
+    }
 
     /// Test the example given in the [GitHub CODEOWNERS
     /// documentation](https://docs.github.com/en/github/creating-cloning-and-archiving-repositories/creating-a-repository-on-github/about-code-owners#codeowners-syntax).
@@ -198,8 +224,8 @@ apps/ @octocat
             assert_eq!(pattern, rule.pattern);
             assert_eq!(owners, rule.owners);
 
-            let matched_rule: Option<&Rule> = co.matches(test);
-            assert_eq!(Some(rule), matched_rule);
+            let matched_rule: Option<&[Owner]> = co.matches(test);
+            assert_eq!(Some(rule.owners.as_slice()), matched_rule);
         };
 
         test_rule(
@@ -278,7 +304,7 @@ apps/ @octocat
             Rule::parse("some/sub/path @user   someone@example.com").unwrap(),
             Rule {
                 pattern: "some/sub/path".into(),
-                matcher: globset::Glob::new("some/sub/path").unwrap().compile_matcher(),
+                matchers: vec![globset::Glob::new("some/sub/path").unwrap().compile_matcher()],
                 owners: vec![
                     Owner::Handle("@user".to_owned()),
                     Owner::Email("someone@example.com".to_owned())
